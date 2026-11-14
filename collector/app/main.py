@@ -53,18 +53,20 @@ async def index() -> dict:
     responses={503: {"description": "失步：启动中、断流或发现缺号，盘口不可信"}},
 )
 async def get_book():
-    async with manager.lock:
-        if not manager.synced:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "book_not_synchronized",
-                    "detail": "盘口未同步（启动/断流/缺号恢复中），暂不可信",
-                    "synced": False,
-                    "last_error": manager.last_error,
-                },
-            )
-        return manager.book.view()
+    # 存活 + 已同步双重条件：缺号/断流一经发现即 503，
+    # 已断连接的迟到快照不会让盘口重新可用。
+    available, view, last_error = await manager.book_view()
+    if not available:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "book_not_synchronized",
+                "detail": "盘口未同步（启动/断流/缺号恢复中），暂不可信",
+                "synced": False,
+                "last_error": last_error,
+            },
+        )
+    return view
 
 
 @app.get("/status", summary="查询同步状态与统计")

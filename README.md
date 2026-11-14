@@ -33,16 +33,29 @@ python3 scripts/smoke_test.py     # 端到端冒烟
 
 ## 采集器衔接规则（collector/app/sync_manager.py）
 
-1. **启动 / 断流 / 发现缺号 → 立即失步**：`/book` 返回 503，`/status.synced=false`。
-2. **恢复流程**：先连 WS 并**持续缓冲增量**（取快照期间一条不丢），同时用 httpx 取快照。
+1. **启动 / 断流 / 发现缺号 → 立即失步**：在同一次持锁内把 `synced` 置 `False`，
+   `/book` 下一次查询即返回 503，`/status.synced=false`。缺号/断流一经发现，
+   不存在“WebSocket 关闭清理尚未结束、`/book` 仍返回 200”的窗口。
+2. **恢复流程**：每轮重连递增 `generation` 并创建连接令牌 `ConnectionEpoch`；
+   先连 WS 并**持续缓冲增量**（取快照期间一条不丢），同时用 httpx 取快照。
 3. **衔接**：丢弃 `seq ≤ 快照seq` 的缓冲（含重复，保证**恰好应用一次**），
    其余必须从 `快照seq+1` 开始**逐条连续**，否则本轮作废重来。
 4. **完整衔接才恢复查询**；同步后每条增量仍校验 `seq == last+1`，缺号即回到第 1 步。
-5. **迟到快照防护**：每轮恢复递增 `generation`，快照请求带世代号；
-   响应返回时世代已更替（重连前发起的迟到快照）一律丢弃，
-   **不恢复可用状态、不覆盖新盘口**（`/status` 中 `stale_snapshots` 计数）。
-6. **原子可见**：同一增量的多档变更先在副本上应用再整体交换，
+5. **已断连接的快照不得让盘口重新可用**（两道互相补强的闸）：
+   - **活性闸（主）**：接收循环在 `recv()` 失败或缺号时，就地把当前令牌标
+     `dead`（一次无锁属性赋值，与事件循环调度先后无关）。快照安装与 `/book`
+     查询都在持锁时核对令牌身份与 `dead` 标志——**快照已返回、正等状态锁时
+     连接断开，锁释放后该快照也会被拒绝，绝不会安装为可查询盘口**；
+   - **闭环守卫（补强）**：每轮一个协程从周期开始就挂在 `Condition` 等待队列上
+     （先于任何快照安装排队），连接死亡被唤醒后优先拿锁置 `synced=False`，
+     进一步消除“安装协程先被唤醒”的调度缝隙。
+6. **迟到快照防护**：每轮恢复更换令牌并递增 `generation`；重连前发起的快照
+   响应在安装处做世代号 + 令牌身份双重核对，一律丢弃，**不恢复可用状态、
+   不覆盖新盘口**（`/status` 中 `stale_snapshots` 计数）。
+7. **原子可见**：同一增量的多档变更先在副本上应用再整体交换，
    查询只能看到应用前或应用后的完整状态；`/book` 返回 `seq` + 买降序/卖升序盘口。
+8. **恢复条件**：只有**新连接**的快照与该连接期间收到的**连续增量**完整衔接后，
+   `synced` 才会回到 `true`、`/book` 恢复 200。`/status` 在任何时刻都可查。
 
 ## 故障注入（行情源控制面，均可在 http://localhost:8000/docs 上直接调用）
 
@@ -75,9 +88,13 @@ curl -X POST 'http://localhost:8000/control/pause?seconds=3'      # 暂停推送
 ├── docker-compose.yml
 ├── collector/                 # 采集器
 │   ├── app/orderbook.py       #   订单簿 + 快照衔接（纯逻辑）
-│   ├── app/sync_manager.py    #   WS/快照/世代管理/自愈循环
-│   ├── app/main.py            #   FastAPI: /book /status
-│   └── tests/                 #   pytest 单测（16 项）
+│   ├── app/sync_manager.py    #   WS/快照/连接令牌/闭环守卫/自愈循环
+│   ├── app/main.py            #   FastAPI: /book /status /docs
+│   └── tests/                 #   pytest 单测（26 项）
+│       ├── test_orderbook.py  #     订单簿/衔接/协议校验
+│       ├── test_sync_manager.py  #  缺号即失步、去重、迟到快照
+│       ├── test_cycle_races.py    #  失步交接竞态（两个缺陷的精确复现）
+│       └── test_api.py            #  /book 200/503 与 /status 契约
 ├── market_source/app/main.py  # 行情源 + 故障注入控制面
 └── scripts/smoke_test.py      # 端到端冒烟（丢序/断线/延迟快照/序号单调）
 ```
